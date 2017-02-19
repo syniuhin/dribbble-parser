@@ -1,9 +1,13 @@
 package api
 
-import javax.inject.{Inject, Singleton}
+import javax.inject.{Inject, Named, Singleton}
 
-import akka.actor.ActorSystem
-import akka.pattern.after
+import actor.DribbbleActor.ApiRequest
+import akka.actor.{ActorRef, ActorSystem, Props}
+import akka.contrib.throttle.Throttler._
+import akka.contrib.throttle.TimerBasedThrottler
+import akka.pattern.{after, ask}
+import akka.util.Timeout
 import play.api.Logger
 import play.api.libs.json._
 import play.api.libs.ws.{WSClient, WSResponse}
@@ -20,7 +24,9 @@ object DribbbleApi {
   val endpoint = "https://api.dribbble.com/v1/"
   val clientAccessToken = "c786d23609b4adb68a0e2a23a6e26ab95c0d448043855de9386c4b8d526ab7a9"
   // It's weird, but dribbble API tells a time with ~100 sec lag.
-  val dribbbleLag = 100.seconds
+  val dribbbleLag: FiniteDuration = 100.seconds
+  // Extreme case when daily rate limit is exceeded.
+  implicit val timeout: Timeout = 1.day
 
   trait ApiResponse
 
@@ -36,16 +42,18 @@ object DribbbleApi {
 
 @Singleton
 class DribbbleApi @Inject()(system: ActorSystem,
+                            @Named("dribbble-actor") dribbbleActor: ActorRef,
                             wsClient: WSClient) {
 
   import DribbbleApi._
 
-  def apiRequest(url: String): Future[WSResponse] = {
-    Logger.debug("Requesting " + url)
-    wsClient.url(url).withQueryString(("access_token", clientAccessToken), ("per_page", "100")).get()
-  }
+  private val requestingActor = system.actorOf(Props(
+    classOf[TimerBasedThrottler],
+    60 msgsPer 1.minute))
+  // Set the target
+  requestingActor ! SetTarget(Some(dribbbleActor))
 
-  def nextLink(content: String): Option[String] = {
+  def parseNextLink(content: String): Option[String] = {
     content.split(",").toList.map { s =>
       (s.substring(s.indexOf("<") + 1, s.indexOf(">")),
         s.substring(s.indexOf("\"") + 1, s.lastIndexOf("\"")))
@@ -55,14 +63,16 @@ class DribbbleApi @Inject()(system: ActorSystem,
     }
   }
 
-  def pagedMethod(url: String): Future[(Stream[JsValue], Option[String])] =
-    apiRequest(url) map { response =>
-      val requestsRemaining = response.header("X-RateLimit-Remaining").getOrElse("-1").toLong
-      Logger.debug(s"Requests remaining: $requestsRemaining")
+  def requestPage(url: String): Future[(Stream[JsValue], Option[String])] =
+    requestingActor ? ApiRequest(url) map {
+      _.asInstanceOf[WSResponse]
+    } map { response =>
       if (response.status == 200) {
+        val requestsRemaining = response.header("X-RateLimit-Remaining").getOrElse("-1").toLong
+        Logger.debug(s"Requests remaining: $requestsRemaining")
         response.json.validate[JsArray] match {
           case s: JsSuccess[JsArray] => (s.value.value.toStream, response.header("Link") match {
-            case Some(link) => nextLink(link)
+            case Some(link) => parseNextLink(link)
             case None => None
           })
           case e: JsError => throw UnknownError(JsError.toJson(e).toString)
@@ -75,27 +85,27 @@ class DribbbleApi @Inject()(system: ActorSystem,
       }
     } recoverWith {
       case rle: RateLimitError =>
-        // Reset time is not updated properly. TODO: Implement using akka throttler.
+        // Warning: reset time is not updated properly.
         after(rle.releasedAt.seconds - System.currentTimeMillis().milliseconds + dribbbleLag,
-          system.scheduler)(pagedMethod(url))
+          system.scheduler)(requestPage(url))
     }
 
-  def method(url: String): Future[Stream[JsValue]] = {
-    pagedMethod(url) flatMap {
+  def request(url: String): Future[Stream[JsValue]] = {
+    requestPage(url) flatMap {
       // TODO: Unroll the sequence.
-      case (seq, Some(nextLink)) => Future.sequence(Stream(Future(seq), method(nextLink))).map(_.flatten)
+      case (seq, Some(nextLink)) => Future.sequence(Stream(Future(seq), request(nextLink))).map(_.flatten)
       case (seq, None) => Future(seq)
     }
   }
 
   def top10(user: String): Future[Seq[JsObject]] = {
-    method(endpoint + s"users/$user/followers").map { followers =>
+    request(endpoint + s"users/$user/followers").map { followers =>
       followers.map { follower =>
         (follower \ "follower" \ "id").as[Long]
       }
     } flatMap { followers =>
       Future.sequence(followers.map { follower =>
-        method(endpoint + s"users/$follower/shots").map { shots =>
+        request(endpoint + s"users/$follower/shots").map { shots =>
           shots.map { shot =>
             (shot \ "id").as[Long]
           }
@@ -103,7 +113,7 @@ class DribbbleApi @Inject()(system: ActorSystem,
       }).map(_.flatten)
     } flatMap { shots =>
       Future.sequence(shots.map { shot =>
-        method(endpoint + s"shots/$shot/likes").map { likes =>
+        request(endpoint + s"shots/$shot/likes").map { likes =>
           likes.map { like =>
             (like \ "user").as[JsObject]
           }
