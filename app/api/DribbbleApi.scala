@@ -8,21 +8,20 @@ import akka.contrib.throttle.Throttler._
 import akka.contrib.throttle.TimerBasedThrottler
 import akka.pattern.{after, ask}
 import akka.util.Timeout
-import play.api.Logger
+import model._
+import play.api.{Configuration, Logger}
 import play.api.libs.json._
 import play.api.libs.ws.{WSClient, WSResponse}
+import play.mvc.Http
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.concurrent.duration._
 
-/**
-  * Created by syniuhin with love <3.
-  */
 object DribbbleApi {
 
-  val endpoint = "https://api.dribbble.com/v1/"
-  val clientAccessToken = "c786d23609b4adb68a0e2a23a6e26ab95c0d448043855de9386c4b8d526ab7a9"
+  type Page = Seq[JsValue]
+
   // It's weird, but dribbble API tells a time with ~100 sec lag.
   val dribbbleLag: FiniteDuration = 100.seconds
   // Extreme case when daily rate limit is exceeded.
@@ -40,19 +39,26 @@ object DribbbleApi {
 
 }
 
+/**
+  * Contains methods to request an API and handle its responses.
+  */
 @Singleton
-class DribbbleApi @Inject()(system: ActorSystem,
+class DribbbleApi @Inject()(config: Configuration,
+                            system: ActorSystem,
                             @Named("dribbble-actor") dribbbleActor: ActorRef,
                             wsClient: WSClient) {
 
   import DribbbleApi._
 
-  private val requestingActor = system.actorOf(Props(
-    classOf[TimerBasedThrottler],
-    60 msgsPer 1.minute))
-  // Set the target
-  requestingActor ! SetTarget(Some(dribbbleActor))
+  private val endpoint = config.getString("dribbble.endpoint").get
 
+  private val requestActor = system.actorOf(Props(classOf[TimerBasedThrottler], 60 msgsPer 1.minute))
+  // Set the target
+  requestActor ! SetTarget(Some(dribbbleActor))
+
+  /**
+    * Parses link from a response header.
+    */
   def parseNextLink(content: String): Option[String] = {
     content.split(",").toList.map { s =>
       (s.substring(s.indexOf("<") + 1, s.indexOf(">")),
@@ -63,63 +69,70 @@ class DribbbleApi @Inject()(system: ActorSystem,
     }
   }
 
-  def requestPage(url: String): Future[(Stream[JsValue], Option[String])] =
-    requestingActor ? ApiRequest(url) map {
+  /**
+    * Requests single page of data from an API.
+    */
+  def requestPage(url: String): Future[(Seq[JsValue], Option[String])] =
+    requestActor ? ApiRequest(url) map {
       _.asInstanceOf[WSResponse]
     } map { response =>
-      if (response.status == 200) {
+      if (response.status == Http.Status.OK) {
         val requestsRemaining = response.header("X-RateLimit-Remaining").getOrElse("-1").toLong
         Logger.debug(s"Requests remaining: $requestsRemaining")
         response.json.validate[JsArray] match {
-          case s: JsSuccess[JsArray] => (s.value.value.toStream, response.header("Link") match {
+          case s: JsSuccess[JsArray] => (s.value.value, response.header("Link") match {
             case Some(link) => parseNextLink(link)
-            case None => None
+            case _ => None
           })
           case e: JsError => throw UnknownError(JsError.toJson(e).toString)
         }
       } else if (response.status == 429) {
-        Logger.warn(s"Rate limit exceeded at ${System.currentTimeMillis() / 1000} with reset at ${response.header("X-RateLimit-Reset").getOrElse("<unknown>").toLong}")
-        throw RateLimitError(response.header("X-RateLimit-Reset").getOrElse("0").toLong)
+        val resetTimeOpt = response.header("X-RateLimit-Reset")
+        Logger.warn(s"Rate limit exceeded at ${System.currentTimeMillis().milliseconds.toSeconds} with reset at " +
+          s"${resetTimeOpt.getOrElse("<unknown>")}")
+        throw RateLimitError(resetTimeOpt.getOrElse("0").toLong)
       } else {
         throw UnknownError(s"Unknown response code: $response")
       }
     } recoverWith {
       case rle: RateLimitError =>
-        // Warning: reset time is not updated properly.
+        // Warning: reset time is not updated properly: it remains the same even when the rate limit is exceeded.
+        // Therefore this strategy is a fallback to a throttling.
         after(rle.releasedAt.seconds - System.currentTimeMillis().milliseconds + dribbbleLag,
           system.scheduler)(requestPage(url))
     }
 
-  def request(url: String): Future[Stream[JsValue]] = {
-    requestPage(url) flatMap {
-      // TODO: Unroll the sequence.
-      case (seq, Some(nextLink)) => Future.sequence(Stream(Future(seq), request(nextLink))).map(_.flatten)
-      case (seq, None) => Future(seq)
+  def getRequestUrl(entity: Entity[_]): String = (entity : @unchecked) match {
+    case _ if entity.url != null => entity.url
+    case User(username, _) => endpoint + s"users/$username/followers"
+    case Follower(id, _) => endpoint + s"users/$id/shots"
+    case Shot(id, _) => endpoint + s"shots/$id/likes"
+  }
+
+  def process[T](entity: Entity[T]): Future[Seq[Page]] = {
+    requestPage(getRequestUrl(entity)) flatMap {
+      case (currPage, nextPageLink) =>
+        lazy val res = (entity : @unchecked) match {
+          case User(_, _) =>
+            Future.sequence(currPage map { f =>
+              process(Follower((f \ "follower" \ "id").as[Long]))
+            }).map(_.flatten)
+          case Follower(_, _) =>
+            Future.sequence(currPage map { s =>
+              process(Shot((s \ "id").as[Long]))
+            }).map(_.flatten)
+          case Shot(_, _) =>
+            Future(Seq(currPage.map(s => (s \ "user").as[JsObject])))
+        }
+        Future.sequence(nextPageLink match {
+          case Some(link) => Seq(process(entity.copy(url = link)), res)
+          case _ => Seq(res)
+        }).map(_.flatten)
     }
   }
 
-  def top10(user: String): Future[Seq[JsObject]] = {
-    request(endpoint + s"users/$user/followers").map { followers =>
-      followers.map { follower =>
-        (follower \ "follower" \ "id").as[Long]
-      }
-    } flatMap { followers =>
-      Future.sequence(followers.map { follower =>
-        request(endpoint + s"users/$follower/shots").map { shots =>
-          shots.map { shot =>
-            (shot \ "id").as[Long]
-          }
-        }
-      }).map(_.flatten)
-    } flatMap { shots =>
-      Future.sequence(shots.map { shot =>
-        request(endpoint + s"shots/$shot/likes").map { likes =>
-          likes.map { like =>
-            (like \ "user").as[JsObject]
-          }
-        }
-      })
-    } map { likers =>
+  def top10(username: String): Future[Seq[JsObject]] = {
+    process(User(username)) map { likers =>
       likers.flatten
         .groupBy(identity)
         .map { case (key, value) => Json.obj("user" -> key, "count" -> value.size) }

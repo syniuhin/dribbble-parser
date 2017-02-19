@@ -10,10 +10,6 @@ import scala.concurrent.ExecutionContext.Implicits.global
 
 class Application @Inject()(api: DribbbleApi) extends Controller {
 
-  def index = Action {
-    Ok(views.html.index("Your new application is ready."))
-  }
-
   def top10(user: String) = Action.async {
     api.top10(user) map { res =>
       Ok(JsArray(res))

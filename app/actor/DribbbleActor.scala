@@ -4,28 +4,32 @@ import javax.inject.Inject
 
 import akka.actor._
 import akka.pattern.pipe
-import api.DribbbleApi
-import play.api.Logger
 import play.api.libs.ws.WSClient
+import play.api.{Configuration, Logger}
 
 import scala.concurrent.ExecutionContext.Implicits.global
 
-/**
-  * Created by syniuhin with love <3.
-  */
 object DribbbleActor {
-  case class Top10(user: String)
 
   case class ApiRequest(url: String)
+
 }
 
-class DribbbleActor @Inject() (wsClient: WSClient) extends Actor {
+/**
+  * Requests API and allows application to use throttling.
+  */
+class DribbbleActor @Inject()(config: Configuration,
+                              wsClient: WSClient) extends Actor {
+
   import DribbbleActor._
+
+  private val accessToken = config.getString("dribbble.accessToken").get
 
   override def receive: Receive = {
     case ApiRequest(url: String) =>
       Logger.debug("Requesting " + url)
-      wsClient.url(url).withQueryString(("access_token", DribbbleApi.clientAccessToken),
+      // 100 is a maximum value for per_page query parameter.
+      wsClient.url(url).withQueryString(("access_token", accessToken),
         ("per_page", "100")).get() pipeTo sender
   }
 }
